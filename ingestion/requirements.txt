@@ -1,7 +1,0 @@
-# Data ingestion dependencies
-pyspark==3.5.0
-pandas==2.0.3
-boto3==1.26.165
-python-dotenv==1.0.0
-faker==18.13.0  # For generating fake IoT sensor data
-requests==2.31.0
