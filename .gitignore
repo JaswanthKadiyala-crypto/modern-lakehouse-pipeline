@@ -48,6 +48,40 @@ artifacts/
 spark_logs/
 .spark_logs/
 
+# Logs
+*.log
+logs/
+
+# AWS Credentials
+.aws/
+credentials
+config
+
+# Environment Files
+.env
+.env.local
+.env.*.local
+
+# Local Data (don't track local streaming files)
+C:\streaming_data/
+streaming_data/
+local_streaming_data/
+local_data/
+*.csv
+*.jsonl
+*.txt
+data/
+
+# OS Files
+Thumbs.db
+.DS_Store
+
+# Temp/Cache
+*.tmp
+temp/
+cache/
+.cache/
+
 # Data files
 data/
 *.csv
