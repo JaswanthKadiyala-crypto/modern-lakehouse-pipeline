@@ -1,0 +1,63 @@
+# S3 Streaming Pipeline Makefile Commands
+
+.PHONY: help install-aws setup-s3 stream-text stream-csv stream-iot orchestrate verify-all commit-all
+
+help:
+	@echo "=========================================="
+	@echo "S3 Streaming Pipeline - Available Commands"
+	@echo "=========================================="
+	@echo ""
+	@echo "Setup Commands:"
+	@echo "  make install-aws      - Install AWS CLI and Python packages"
+	@echo "  make setup-s3         - Create S3 bucket with partitions"
+	@echo ""
+	@echo "Streaming Commands:"
+	@echo "  make stream-text      - Stream text files to S3"
+	@echo "  make stream-csv       - Stream CSV files to S3"
+	@echo "  make stream-iot       - Stream IoT data to S3"
+	@echo ""
+	@echo "Automation Commands:"
+	@echo "  make orchestrate      - Run S3 orchestrator"
+	@echo "  make verify-all       - Verify S3 contents"
+	@echo ""
+	@echo "GitHub Commands:"
+	@echo "  make commit-all       - Commit all changes to GitHub"
+	@echo ""
+
+install-aws:
+	@echo "Installing AWS CLI v2 and Python packages..."
+	pip install -r requirements_aws.txt
+	@echo "✓ Installation complete!"
+
+setup-s3:
+	@echo "Creating S3 bucket with partitions..."
+	python aws_setup.py
+	@echo "✓ S3 setup complete!"
+
+stream-text:
+	@echo "Starting text file streaming..."
+	python stream_text_files.py
+
+stream-csv:
+	@echo "Starting CSV file streaming..."
+	python stream_csv_files.py
+
+stream-iot:
+	@echo "Starting IoT data streaming..."
+	python stream_iot_data.py
+
+orchestrate:
+	@echo "Running S3 orchestrator..."
+	python s3_orchestrator.py
+	@echo "✓ Orchestration complete!"
+
+verify-all:
+	@echo "Verifying S3 contents..."
+	aws s3 ls s3://modern-lakehouse-data/ --recursive --summarize
+
+commit-all:
+	@echo "Committing changes to GitHub..."
+	git add .
+	git commit -m "update: S3 streaming pipeline - $$(date +%Y-%m-%d\ %H:%M:%S)"
+	git push origin main
+	@echo "✓ Changes committed and pushed!"

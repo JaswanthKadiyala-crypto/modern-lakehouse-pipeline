@@ -1,0 +1,318 @@
+version: '3.8'
+
+# ==============================================================================
+# Modern Lakehouse Pipeline - Docker Compose Configuration
+# ==============================================================================
+# This file defines all services needed for the complete data lakehouse:
+# - MinIO: S3-compatible object storage (local development)
+# - Airflow: Orchestration engine for DAGs
+# - Spark: Distributed data processing
+# - MLflow: ML experiment tracking and model registry
+# - PostgreSQL: Metadata database for Airflow
+# ==============================================================================
+
+services:
+
+  # ============================================================================
+  # 1. PostgreSQL: Airflow Metadata Database
+  # ============================================================================
+  # Why PostgreSQL?
+  #   - Airflow needs a database to store DAG runs, task logs, connections
+  #   - PostgreSQL is production-grade, handles concurrency well
+  #   - Better than SQLite for production workflows
+  postgres:
+    image: postgres:14-alpine
+    container_name: lakehouse-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lakehouse-net
+    restart: unless-stopped
+
+  # ============================================================================
+  # 2. MinIO: S3-Compatible Object Storage
+  # ============================================================================
+  # Why MinIO?
+  #   - Acts like AWS S3 on your local machine
+  #   - Stores raw data, processed data, models
+  #   - Spark and Airflow read/write from here
+  #   - UI to visualize buckets at http://localhost:9000
+  minio:
+    image: minio/minio:latest
+    container_name: lakehouse-minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"      # S3 API endpoint
+      - "9001:9001"      # Console UI
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lakehouse-net
+    restart: unless-stopped
+
+  # ============================================================================
+  # 3. MinIO Client Setup: Create buckets
+  # ============================================================================
+  # This container initializes MinIO buckets on startup
+  minio-init:
+    image: minio/mc:latest
+    container_name: lakehouse-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc config host add minio http://minio:9000 minioadmin minioadmin;
+      /usr/bin/mc mb minio/lakehouse;
+      /usr/bin/mc mb minio/lakehouse/raw;
+      /usr/bin/mc mb minio/lakehouse/bronze;
+      /usr/bin/mc mb minio/lakehouse/silver;
+      /usr/bin/mc mb minio/lakehouse/gold;
+      /usr/bin/mc mb minio/lakehouse/ml;
+      exit 0;
+      "
+    networks:
+      - lakehouse-net
+    restart: on-failure
+
+  # ============================================================================
+  # 4. Airflow Scheduler
+  # ============================================================================
+  # Why Scheduler?
+  #   - Monitors DAG files and triggers runs on schedule
+  #   - Manages task dependencies and retries
+  #   - Runs tasks on the executor (LocalExecutor)
+  airflow-scheduler:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: lakehouse-airflow-scheduler
+    environment:
+      AIRFLOW_HOME: /opt/airflow
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__CORE__LOGS_FOLDER: /opt/airflow/logs
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__CORE__PLUGINS_FOLDER: /opt/airflow/plugins
+      # MinIO Connection Details
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      S3_ENDPOINT: http://minio:9000
+    volumes:
+      - ../dags:/opt/airflow/dags              # DAG files
+      - ../logs:/opt/airflow/logs              # Task logs
+      - ../plugins:/opt/airflow/plugins        # Custom plugins
+      - ../ingestion:/opt/airflow/ingestion    # Data scripts
+      - ../spark_jobs:/opt/airflow/spark_jobs  # Spark jobs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - lakehouse-net
+    restart: unless-stopped
+    command: scheduler
+
+  # ============================================================================
+  # 5. Airflow Webserver (UI)
+  # ============================================================================
+  # Why Webserver?
+  #   - Beautiful UI to monitor DAGs at http://localhost:8080
+  #   - Trigger DAGs manually
+  #   - View task logs and performance metrics
+  #   - Manage connections and variables
+  airflow-webserver:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: lakehouse-airflow-webserver
+    environment:
+      AIRFLOW_HOME: /opt/airflow
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__CORE__LOGS_FOLDER: /opt/airflow/logs
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__WEBSERVER__RBAC: 'true'
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      S3_ENDPOINT: http://minio:9000
+    volumes:
+      - ../dags:/opt/airflow/dags
+      - ../logs:/opt/airflow/logs
+      - ../plugins:/opt/airflow/plugins
+      - ../ingestion:/opt/airflow/ingestion
+      - ../spark_jobs:/opt/airflow/spark_jobs
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-scheduler:
+        condition: service_started
+    networks:
+      - lakehouse-net
+    restart: unless-stopped
+    command: webserver
+
+  # ============================================================================
+  # 6. Spark Master
+  # ============================================================================
+  # Why Spark Master?
+  #   - Coordinates distributed data processing
+  #   - Spark jobs submit tasks to this master
+  #   - Runs transformations: Bronze → Silver → Iceberg/Delta
+  #   - UI at http://localhost:8888 to monitor jobs
+  spark-master:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: lakehouse-spark-master
+    environment:
+      SPARK_MODE: master
+      SPARK_RPC_AUTHENTICATION_ENABLED: 'no'
+      SPARK_RPC_ENCRYPTION_ENABLED: 'no'
+      SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED: 'no'
+      SPARK_SSL_ENABLED: 'no'
+      # MinIO Connection
+      SPARK_CLASSPATH: /opt/spark/jars/*
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    ports:
+      - "8888:8080"        # Spark Master UI
+      - "7077:7077"        # Spark Master port
+      - "6066:6066"        # REST API
+    volumes:
+      - spark_logs:/var/log/spark
+      - ../spark_jobs:/opt/spark/jobs
+      - spark_jars:/opt/spark/jars
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - lakehouse-net
+    restart: unless-stopped
+    command: bin/spark-class org.apache.spark.deploy.master.Master --ip spark-master --port 7077 --webui-port 8080
+
+  # ============================================================================
+  # 7. Spark Worker
+  # ============================================================================
+  # Why Spark Worker?
+  #   - Actually executes Spark tasks
+  #   - Master distributes work to workers
+  #   - Can scale to multiple workers for real clusters
+  spark-worker:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: lakehouse-spark-worker
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 2G
+      SPARK_WORKER_CORES: 2
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    ports:
+      - "8081:8081"
+    volumes:
+      - spark_logs:/var/log/spark
+      - ../spark_jobs:/opt/spark/jobs
+      - spark_jars:/opt/spark/jars
+    depends_on:
+      - spark-master
+    networks:
+      - lakehouse-net
+    restart: unless-stopped
+
+  # ============================================================================
+  # 8. MLflow Tracking Server
+  # ============================================================================
+  # Why MLflow?
+  #   - Tracks ML experiments (hyperparameters, metrics, artifacts)
+  #   - Model registry (version control for models)
+  #   - UI at http://localhost:5000 for visualization
+  #   - Python code logs model metrics: mlflow.log_metric(), mlflow.log_model()
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: lakehouse-mlflow
+    environment:
+      MLFLOW_BACKEND_STORE_URI: sqlite:////mlflow/mlflow.db
+      MLFLOW_DEFAULT_ARTIFACT_ROOT: /mlflow/artifacts
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow_data:/mlflow
+    networks:
+      - lakehouse-net
+    restart: unless-stopped
+    command: mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:////mlflow/mlflow.db --default-artifact-root /mlflow/artifacts
+
+  # ============================================================================
+  # 9. Jupyter Notebook (Optional: for interactive development)
+  # ============================================================================
+  # Why Jupyter?
+  #   - Explore data interactively
+  #   - Test Spark jobs before scheduling in Airflow
+  #   - Access at http://localhost:8888 (different port than Spark UI)
+  jupyter:
+    image: jupyter/pyspark-notebook:latest
+    container_name: lakehouse-jupyter
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    ports:
+      - "8888:8888"
+    volumes:
+      - ../notebooks:/home/jovyan/work
+      - ../spark_jobs:/home/jovyan/spark_jobs
+    depends_on:
+      - spark-master
+      - minio
+    networks:
+      - lakehouse-net
+    restart: unless-stopped
+    command: start-notebook.sh --NotebookApp.token='' --NotebookApp.password=''
+
+# ==============================================================================
+# Networks
+# ==============================================================================
+networks:
+  lakehouse-net:
+    driver: bridge
+
+# ==============================================================================
+# Volumes (Persistent storage)
+# ==============================================================================
+volumes:
+  postgres_data:
+    driver: local
+  minio_data:
+    driver: local
+  spark_logs:
+    driver: local
+  spark_jars:
+    driver: local
+  mlflow_data:
+    driver: local

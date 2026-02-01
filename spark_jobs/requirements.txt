@@ -1,0 +1,10 @@
+# Spark ETL dependencies
+pyspark==3.5.0
+pandas==2.0.3
+pyarrow==12.0.1
+boto3==1.26.165
+python-dotenv==1.0.0
+
+# Table formats
+iceberg-spark-runtime==1.4.0
+delta-spark==3.0.0
